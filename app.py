@@ -32,11 +32,13 @@ async def trigger_call():
         os.getenv("TWILIO_ACCOUNT_SID"),
         os.getenv("TWILIO_AUTH_TOKEN"),
     )
+
     call = client.calls.create(
         to=to_number,
-        from_=os.getenv("TWILIO_PHONE_NUMBER"),
-        url=f"{os.getenv('RENDER_EXTERNAL_URL')}/voice"
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),  # MUST be +E.164 format, e.g. +14155551234
+        url=f"{os.getenv('RAILWAY_URL')}/voice"  # use new var
     )
+    print("CALL CREATED:", call.sid)
     return {"status": "calling", "sid": call.sid}, 200
 
 
@@ -45,7 +47,7 @@ async def trigger_call():
 async def voice():
     resp = VoiceResponse()
     start = Start()
-    ws_url = os.getenv("RENDER_EXTERNAL_URL").replace("https://", "wss://") + "/media"
+    ws_url = os.getenv("RAILWAY_URL").replace("https://", "wss://") + "/media"
     start.stream(url=ws_url)
     resp.append(start)
     resp.say("Hello! You are connected to UniCall AI. Start speaking now.")
