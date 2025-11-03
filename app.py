@@ -5,9 +5,10 @@ from twilio.rest import Client
 import google.generativeai as genai
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import AudioEvent
 
 # ---------- CONFIG ----------
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")  # us-east-1 supports Transcribe
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID", "H8bdWZHK2OgZwTN7ponr")
 GEN_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -35,8 +36,8 @@ async def trigger_call():
 
     call = client.calls.create(
         to=to_number,
-        from_=os.getenv("TWILIO_PHONE_NUMBER"),  # MUST be +E.164 format, e.g. +14155551234
-        url=f"{os.getenv('RAILWAY_URL')}/voice"  # use new var
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),
+        url=f"{os.getenv('RAILWAY_URL')}/voice"
     )
     print("CALL CREATED:", call.sid)
     return {"status": "calling", "sid": call.sid}, 200
@@ -50,7 +51,7 @@ async def voice():
     ws_url = os.getenv("RAILWAY_URL").replace("https://", "wss://") + "/media"
     start.stream(url=ws_url)
     resp.append(start)
-    resp.say("Hello! You are connected to UniCall AI. Start speaking now.")
+    # no <Say> tag here — ElevenLabs will handle the greeting
     return str(resp), 200, {"Content-Type": "text/xml"}
 
 
@@ -60,8 +61,6 @@ async def home():
 
 
 # ---------- AWS Transcribe Streaming ----------
-from amazon_transcribe.model import AudioEvent
-
 class MyTranscriptHandler(TranscriptResultStreamHandler):
     def __init__(self, stream, output_queue):
         super().__init__(stream)
@@ -77,12 +76,13 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
                     print("AWS Transcript:", text)
                     await self.output_queue.put(text)
 
+
 async def aws_transcribe_stream(audio_queue, transcript_queue):
     """Send audio to AWS Transcribe and push transcripts into transcript_queue."""
     try:
         client = TranscribeStreamingClient(region=os.getenv("AWS_REGION", "us-east-1"))
 
-        # Start a bidirectional stream (not a context manager)
+        # Start bidirectional stream
         stream = await client.start_stream_transcription(
             language_code="en-US",
             media_sample_rate_hz=8000,
@@ -99,14 +99,11 @@ async def aws_transcribe_stream(audio_queue, transcript_queue):
                     break
                 await stream.input_stream.send_audio_event(audio_chunk=chunk)
 
-        # run audio sender + transcript receiver concurrently
         await asyncio.gather(send_audio(), handler.handle_events())
 
     except Exception as e:
         print("⚠️ AWS Transcribe error:", e)
         await transcript_queue.put(None)
-
-
 
 
 # ---------- LLM (Gemini) ----------
@@ -123,8 +120,10 @@ async def synthesize_speech(text: str) -> bytes:
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json"
     }
-    payload = {"text": text,
-               "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}}
+    payload = {
+        "text": text,
+        "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}
+    }
     r = requests.post(url, headers=headers, json=payload)
     return r.content
 
@@ -138,9 +137,20 @@ async def handle_twilio_media():
     audio_queue = asyncio.Queue()
     transcript_queue = asyncio.Queue()
 
+    # Start AWS transcribe listener
     transcribe_task = asyncio.create_task(
         aws_transcribe_stream(audio_queue, transcript_queue)
     )
+
+    # 👋 Send initial greeting from ElevenLabs
+    greeting_text = "Hello! This is UniCall AI assistant. How can I help you today?"
+    greeting_audio = await synthesize_speech(greeting_text)
+    audio_base64 = base64.b64encode(greeting_audio).decode("utf-8")
+    await ws.send(json.dumps({
+        "event": "media",
+        "media": {"payload": audio_base64}
+    }))
+    await asyncio.sleep(0.5)
 
     async def consume_ws():
         """Receive audio from Twilio."""
@@ -151,7 +161,9 @@ async def handle_twilio_media():
             data = json.loads(msg)
             event = data.get("event")
 
-            if event == "media":
+            if event in ("start", "connected"):
+                print("Twilio stream started")
+            elif event == "media":
                 raw = base64.b64decode(data["media"]["payload"])
                 await audio_queue.put(raw)
             elif event == "stop":
@@ -170,23 +182,20 @@ async def handle_twilio_media():
             ai_reply = await ask_ai(text)
             print("AI:", ai_reply)
 
-            # Convert text → speech (ElevenLabs)
+            # Text → Speech → Send to Twilio
             speech_bytes = await synthesize_speech(ai_reply)
-
-            # Convert to base64 for Twilio
             audio_base64 = base64.b64encode(speech_bytes).decode("utf-8")
 
-            # Send audio back to Twilio
             await ws.send(json.dumps({
                 "event": "media",
                 "media": {"payload": audio_base64}
             }))
 
-            # Optional small delay to let audio play smoothly
             await asyncio.sleep(0.5)
 
     await asyncio.gather(consume_ws(), consume_transcripts(), transcribe_task)
     print("[Twilio disconnected]")
+
 
 # ---------- Entry ----------
 if __name__ == "__main__":
