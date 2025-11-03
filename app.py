@@ -186,7 +186,7 @@ if __name__ == "__main__":
     from hypercorn.config import Config
 
     config = Config()
-    config.bind = [f"0.0.0.0:{os.getenv('PORT', '10000')}"]
+    config.bind = [f"0.0.0.0:{os.getenv('PORT', '8080')}"]
     config.use_reloader = False
     print("🚀 Starting UniCall AI with full streaming pipeline...")
     asyncio.run(hypercorn.asyncio.serve(app, config))
