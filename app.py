@@ -79,16 +79,16 @@ class MyTranscriptHandler(TranscriptResultStreamHandler):
 
 async def aws_transcribe_stream(audio_queue, transcript_queue):
     """Send audio to AWS Transcribe and push transcripts into transcript_queue."""
-    client = TranscribeStreamingClient(region=os.getenv("AWS_REGION", "us-east-1"))
+    try:
+        client = TranscribeStreamingClient(region=os.getenv("AWS_REGION", "us-east-1"))
 
-    # 👇 FIXED LINE HERE
-    stream = await client.start_stream_transcription(
-        language_code="en-US",
-        media_sample_rate_hz=8000,
-        media_encoding="pcm",
-    )
+        # Start a bidirectional stream (not a context manager)
+        stream = await client.start_stream_transcription(
+            language_code="en-US",
+            media_sample_rate_hz=8000,
+            media_encoding="pcm",
+        )
 
-    async with stream:
         handler = MyTranscriptHandler(stream.output_stream, transcript_queue)
 
         async def send_audio():
@@ -99,7 +99,13 @@ async def aws_transcribe_stream(audio_queue, transcript_queue):
                     break
                 await stream.input_stream.send_audio_event(audio_chunk=chunk)
 
+        # run audio sender + transcript receiver concurrently
         await asyncio.gather(send_audio(), handler.handle_events())
+
+    except Exception as e:
+        print("⚠️ AWS Transcribe error:", e)
+        await transcript_queue.put(None)
+
 
 
 
