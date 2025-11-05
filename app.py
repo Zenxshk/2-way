@@ -1,20 +1,31 @@
-import os, json, base64, requests, asyncio
-from quart import Quart, request
-from twilio.rest import Client
+import os, json, asyncio, base64, requests, threading
+from quart import Quart, request, websocket
 from twilio.twiml.voice_response import VoiceResponse, Start
+from twilio.rest import Client
+import google.generativeai as genai
+import azure.cognitiveservices.speech as speechsdk
 
-app = Quart(__name__)
 
-# ----------- CONFIG -----------
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.getenv("TWILIO_PHONE_NUMBER")
-RAILWAY_URL = os.getenv("RAILWAY_URL")  # e.g. https://2-way-production.up.railway.app
+# ---------- CONFIG ----------
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+AZURE_SPEECH_ENDPOINT = os.getenv("AZURE_SPEECH_ENDPOINT")
 
 ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID", "H8bdWZHK2OgZwTN7ponr")
 
-# ----------- TRIGGER CALL -----------
+GEN_API_KEY = os.getenv("GOOGLE_API_KEY")
+genai.configure(api_key=GEN_API_KEY)
+
+SYSTEM_PROMPT = """
+You are UniCall AI — a polite, knowledgeable virtual agent for Galaxy Auto Products.
+Keep your answers short, natural, and helpful.
+"""
+
+app = Quart(__name__)
+
+
+# ---------- Twilio outbound call trigger ----------
 @app.post("/trigger-call")
 async def trigger_call():
     data = await request.get_json()
@@ -22,77 +33,178 @@ async def trigger_call():
     if not to_number:
         return {"error": "Missing 'to' number"}, 400
 
-    client = Client(TWILIO_SID, TWILIO_AUTH)
-    call = client.calls.create(
-        to=to_number,
-        from_=TWILIO_FROM,
-        url=f"{RAILWAY_URL}/voice"
+    client = Client(
+        os.getenv("TWILIO_ACCOUNT_SID"),
+        os.getenv("TWILIO_AUTH_TOKEN"),
     )
 
-    print(f"✅ Call triggered: {call.sid}")
+    call = client.calls.create(
+        to=to_number,
+        from_=os.getenv("TWILIO_FROM_NUMBER"),  # unified env name
+        url=f"{os.getenv('RAILWAY_URL')}/voice"
+    )
+    print("CALL CREATED:", call.sid)
     return {"status": "calling", "sid": call.sid}, 200
 
 
-# ----------- TWILIO WEBHOOK (when call connects) -----------
+# ---------- Twilio voice webhook ----------
 @app.post("/voice")
 async def voice():
-    """When Twilio connects the call, this plays ElevenLabs audio."""
-    print("☎️ Twilio webhook triggered — generating ElevenLabs greeting...")
-
-    # 1️⃣ Generate audio using ElevenLabs API
-    greeting_text = "Hello! This is UniCall AI assistant. How can I help you today?"
-    audio_url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
-    headers = {"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "text": greeting_text,
-        "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}
-    }
-
-    # Make request to ElevenLabs
-    r = requests.post(audio_url, headers=headers, json=payload)
-    if r.status_code != 200:
-        print(f"❌ ElevenLabs error: {r.status_code} {r.text}")
-        # fallback: Twilio <Say> for debugging
-        resp = VoiceResponse()
-        resp.say("Sorry, the greeting failed to generate.")
-        return str(resp), 200, {"Content-Type": "text/xml"}
-
-    # 2️⃣ Save audio temporarily
-    filename = "/tmp/greeting.mp3"
-    with open(filename, "wb") as f:
-        f.write(r.content)
-    print(f"✅ Saved ElevenLabs greeting as {filename}")
-
-    # 3️⃣ Twilio plays audio from a public URL — so serve it via your Railway app
-    # We'll expose /greeting endpoint below
     resp = VoiceResponse()
-    resp.play(f"{RAILWAY_URL}/greeting")
+    start = Start()
+    ws_url = os.getenv("RAILWAY_URL").replace("https://", "wss://") + "/media"
+    start.stream(url=ws_url)
+    resp.append(start)
+    resp.say("Hello! You are connected to UniCall AI. Start speaking now.")
     return str(resp), 200, {"Content-Type": "text/xml"}
-
-
-# ----------- SERVE THE AUDIO FILE -----------
-@app.get("/greeting")
-async def greeting():
-    """Serve the ElevenLabs greeting audio file to Twilio."""
-    from quart import send_file
-    filename = "/tmp/greeting.mp3"
-    if not os.path.exists(filename):
-        return "Greeting not found", 404
-    return await send_file(filename, mimetype="audio/mpeg")
 
 
 @app.get("/")
 async def home():
-    return "🚀 Simple Twilio + ElevenLabs working!", 200
+    return "🚀 UniCall AI (Azure Streaming Version) is running!", 200
 
 
-# ----------- ENTRY POINT -----------
+# ---------- Azure Speech Streaming ----------
+async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: asyncio.Queue):
+    """
+    Send Twilio audio to Azure Speech (streaming) and push transcripts to transcript_queue.
+    """
+    try:
+        # Configure Azure Speech
+        if AZURE_SPEECH_ENDPOINT:
+            speech_config = speechsdk.SpeechConfig(endpoint=AZURE_SPEECH_ENDPOINT, subscription=AZURE_SPEECH_KEY)
+        else:
+            speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
+
+        speech_config.speech_recognition_language = "en-US"
+
+        # Create push stream & recognizer
+        push_stream = speechsdk.audio.PushAudioInputStream()
+        audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
+        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+
+        # Callback: recognized text
+        def recognized_cb(evt):
+            if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+                text = evt.result.text.strip()
+                if text:
+                    print("Azure Transcript:", text)
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.call_soon_threadsafe(asyncio.create_task, transcript_queue.put(text))
+                    except RuntimeError:
+                        transcript_queue.put_nowait(text)
+
+        def canceled_cb(evt):
+            print("Azure recognition canceled:", evt)
+
+        recognizer.recognized.connect(recognized_cb)
+        recognizer.canceled.connect(canceled_cb)
+
+        recognizer.start_continuous_recognition()
+
+        # Feed audio into Azure push stream
+        while True:
+            chunk = await audio_queue.get()
+            if chunk is None:
+                push_stream.close()
+                recognizer.stop_continuous_recognition()
+                await transcript_queue.put(None)
+                break
+            push_stream.write(bytearray(chunk))
+
+    except Exception as e:
+        print("⚠ Azure Transcribe error:", e)
+        await transcript_queue.put(None)
+
+
+# ---------- LLM (Gemini) ----------
+async def ask_ai(prompt: str) -> str:
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content([SYSTEM_PROMPT, prompt])
+    return response.text.strip() if response else "I'm not sure how to respond."
+
+
+# ---------- ElevenLabs TTS ----------
+async def synthesize_speech(text: str) -> bytes:
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {"text": text,
+               "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}}
+    r = requests.post(url, headers=headers, json=payload)
+    return r.content
+
+
+# ---------- WebSocket handler ----------
+@app.websocket("/media")
+async def handle_twilio_media():
+    print("[Twilio connected]")
+    ws = websocket._get_current_object()
+
+    audio_queue = asyncio.Queue()
+    transcript_queue = asyncio.Queue()
+
+    # Start Azure transcription
+    transcribe_task = asyncio.create_task(
+        azure_transcribe_stream(audio_queue, transcript_queue)
+    )
+
+    async def consume_ws():
+        """Receive audio from Twilio."""
+        while True:
+            msg = await ws.receive()
+            if msg is None:
+                break
+            data = json.loads(msg)
+            event = data.get("event")
+
+            if event == "media":
+                raw = base64.b64decode(data["media"]["payload"])
+                await audio_queue.put(raw)
+            elif event == "stop":
+                await audio_queue.put(None)
+                await transcript_queue.put(None)
+                break
+
+    async def consume_transcripts():
+        """Process caller speech and respond with AI voice."""
+        while True:
+            text = await transcript_queue.get()
+            if text is None:
+                break
+
+            print("Caller:", text)
+            ai_reply = await ask_ai(text)
+            print("AI:", ai_reply)
+
+            # Convert text → speech (ElevenLabs)
+            speech_bytes = await synthesize_speech(ai_reply)
+
+            # Convert to base64 for Twilio
+            audio_base64 = base64.b64encode(speech_bytes).decode("utf-8")
+
+            # Send audio back to Twilio
+            await ws.send(json.dumps({
+                "event": "media",
+                "media": {"payload": audio_base64}
+            }))
+
+            await asyncio.sleep(0.5)
+
+    await asyncio.gather(consume_ws(), consume_transcripts(), transcribe_task)
+    print("[Twilio disconnected]")
+
+
+# ---------- Entry ----------
 if __name__ == "__main__":
     import hypercorn.asyncio
     from hypercorn.config import Config
+
     config = Config()
     config.bind = [f"0.0.0.0:{os.getenv('PORT', '8080')}"]
     config.use_reloader = False
-
-    print("🚀 Running basic Twilio + ElevenLabs server...")
+    print("🚀 Starting UniCall AI (Azure Streaming Version)...")
     asyncio.run(hypercorn.asyncio.serve(app, config))
