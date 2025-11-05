@@ -63,6 +63,20 @@ async def voice():
 async def home():
     return "🚀 UniCall AI (Azure Streaming Version) is running!", 200
 
+import audioop
+
+def convert_twilio_audio(raw_bytes: bytes) -> bytes:
+    """
+    Twilio streams 8kHz μ-law audio. Convert to 16-bit linear PCM for Azure Speech.
+    """
+    try:
+        # Convert μ-law (8-bit) → PCM16 linear (16-bit little endian)
+        pcm16 = audioop.ulaw2lin(raw_bytes, 2)
+        return pcm16
+    except Exception as e:
+        print("Audio conversion error:", e)
+        return raw_bytes  # fallback
+
 
 # ---------- Azure Speech Streaming ----------
 async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: asyncio.Queue):
@@ -79,7 +93,8 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
         speech_config.speech_recognition_language = "en-US"
 
         # Create push stream & recognizer
-        push_stream = speechsdk.audio.PushAudioInputStream()
+        audio_format = speechsdk.audio.AudioStreamFormat(samples_per_second=8000, bits_per_sample=16, channels=1)
+        push_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
         audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
         recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
@@ -111,7 +126,11 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
                 recognizer.stop_continuous_recognition()
                 await transcript_queue.put(None)
                 break
-            push_stream.write(bytearray(chunk))
+
+            # Convert from μ-law → PCM16 before sending to Azure
+            pcm_chunk = convert_twilio_audio(chunk)
+            push_stream.write(pcm_chunk)
+
 
     except Exception as e:
         print("⚠ Azure Transcribe error:", e)
