@@ -96,10 +96,17 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
 
         speech_config.speech_recognition_language = "en-US"
 
-        audio_format = speechsdk.audio.AudioStreamFormat(samples_per_second=8000, bits_per_sample=16, channels=1)
-        push_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
+        audio_format = speechsdk.audio.AudioStreamFormat(
+        samples_per_second=8000,
+        bits_per_sample=16,
+        channels=1
+        )
+        push_stream = speechsdk.audio.PushAudioInputStream(audio_format)
         audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
-        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config,
+            audio_config=audio_config
+        )
 
         def recognized_cb(evt):
             if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
@@ -120,16 +127,24 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
 
         recognizer.start_continuous_recognition()
 
+        first_audio = True
         while True:
             chunk = await audio_queue.get()
             if chunk is None:
+                print("Audio stream ended, stopping recognition...")
                 push_stream.close()
                 recognizer.stop_continuous_recognition()
                 await transcript_queue.put(None)
                 break
 
+            # Wait for first real audio before sending to Azure
+            if first_audio and len(chunk) < 100:
+                continue
+            first_audio = False
+
             pcm_chunk = convert_twilio_audio(chunk)
             push_stream.write(pcm_chunk)
+
 
     except Exception as e:
         print("⚠ Azure Transcribe error:", e)
