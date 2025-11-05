@@ -67,13 +67,23 @@ async def home():
 def convert_twilio_audio(raw_bytes: bytes) -> bytes:
     """
     Twilio streams 8kHz μ-law audio. Convert to 16-bit PCM for Azure Speech.
+    Pure Python version (no audioop / ulaw dependency).
     """
     try:
-        pcm16 = ulaw.decode(raw_bytes)  # 👈 simple ulaw decoding
-        return pcm16
+        pcm16 = bytearray()
+        for b in raw_bytes:
+            b = b ^ 0xFF  # bit inversion
+            sign = b & 0x80
+            exponent = (b & 0x70) >> 4
+            mantissa = b & 0x0F
+            magnitude = ((mantissa << 4) + 8) << (exponent + 3)
+            sample = -magnitude if sign else magnitude
+            pcm16.extend(sample.to_bytes(2, byteorder='little', signed=True))
+        return bytes(pcm16)
     except Exception as e:
         print("Audio conversion error:", e)
-        return raw_bytes  # fallback
+        return raw_bytes
+
 
 
 # ---------- Azure Speech Streaming ----------
