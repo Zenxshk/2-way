@@ -4,7 +4,7 @@ from twilio.twiml.voice_response import VoiceResponse, Start
 from twilio.rest import Client
 import google.generativeai as genai
 import azure.cognitiveservices.speech as speechsdk
-
+import ulaw  # 👈 new import replaces `audioop`
 
 # ---------- CONFIG ----------
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
@@ -23,7 +23,6 @@ Keep your answers short, natural, and helpful.
 """
 
 app = Quart(__name__)
-
 
 # ---------- Twilio outbound call trigger ----------
 @app.post("/trigger-call")
@@ -63,15 +62,14 @@ async def voice():
 async def home():
     return "🚀 UniCall AI (Azure Streaming Version) is running!", 200
 
-import audioop
 
+# ---------- μ-law → PCM16 Conversion ----------
 def convert_twilio_audio(raw_bytes: bytes) -> bytes:
     """
-    Twilio streams 8kHz μ-law audio. Convert to 16-bit linear PCM for Azure Speech.
+    Twilio streams 8kHz μ-law audio. Convert to 16-bit PCM for Azure Speech.
     """
     try:
-        # Convert μ-law (8-bit) → PCM16 linear (16-bit little endian)
-        pcm16 = audioop.ulaw2lin(raw_bytes, 2)
+        pcm16 = ulaw.decode(raw_bytes)  # 👈 simple ulaw decoding
         return pcm16
     except Exception as e:
         print("Audio conversion error:", e)
@@ -84,7 +82,6 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
     Send Twilio audio to Azure Speech (streaming) and push transcripts to transcript_queue.
     """
     try:
-        # Configure Azure Speech
         if AZURE_SPEECH_ENDPOINT:
             speech_config = speechsdk.SpeechConfig(endpoint=AZURE_SPEECH_ENDPOINT, subscription=AZURE_SPEECH_KEY)
         else:
@@ -92,13 +89,11 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
 
         speech_config.speech_recognition_language = "en-US"
 
-        # Create push stream & recognizer
         audio_format = speechsdk.audio.AudioStreamFormat(samples_per_second=8000, bits_per_sample=16, channels=1)
         push_stream = speechsdk.audio.PushAudioInputStream(stream_format=audio_format)
         audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
         recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
-        # Callback: recognized text
         def recognized_cb(evt):
             if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
                 text = evt.result.text.strip()
@@ -118,7 +113,6 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
 
         recognizer.start_continuous_recognition()
 
-        # Feed audio into Azure push stream
         while True:
             chunk = await audio_queue.get()
             if chunk is None:
@@ -127,10 +121,8 @@ async def azure_transcribe_stream(audio_queue: asyncio.Queue, transcript_queue: 
                 await transcript_queue.put(None)
                 break
 
-            # Convert from μ-law → PCM16 before sending to Azure
             pcm_chunk = convert_twilio_audio(chunk)
             push_stream.write(pcm_chunk)
-
 
     except Exception as e:
         print("⚠ Azure Transcribe error:", e)
@@ -166,13 +158,11 @@ async def handle_twilio_media():
     audio_queue = asyncio.Queue()
     transcript_queue = asyncio.Queue()
 
-    # Start Azure transcription
     transcribe_task = asyncio.create_task(
         azure_transcribe_stream(audio_queue, transcript_queue)
     )
 
     async def consume_ws():
-        """Receive audio from Twilio."""
         while True:
             msg = await ws.receive()
             if msg is None:
@@ -189,7 +179,6 @@ async def handle_twilio_media():
                 break
 
     async def consume_transcripts():
-        """Process caller speech and respond with AI voice."""
         while True:
             text = await transcript_queue.get()
             if text is None:
@@ -199,13 +188,9 @@ async def handle_twilio_media():
             ai_reply = await ask_ai(text)
             print("AI:", ai_reply)
 
-            # Convert text → speech (ElevenLabs)
             speech_bytes = await synthesize_speech(ai_reply)
-
-            # Convert to base64 for Twilio
             audio_base64 = base64.b64encode(speech_bytes).decode("utf-8")
 
-            # Send audio back to Twilio
             await ws.send(json.dumps({
                 "event": "media",
                 "media": {"payload": audio_base64}
