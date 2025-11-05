@@ -1,10 +1,9 @@
-import os, json, asyncio, base64, requests, threading
+import os, json, asyncio, base64, requests
 from quart import Quart, request, websocket
 from twilio.twiml.voice_response import VoiceResponse, Start
 from twilio.rest import Client
 import google.generativeai as genai
 import azure.cognitiveservices.speech as speechsdk
-import ulaw  # 👈 new import replaces `audioop`
 
 # ---------- CONFIG ----------
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
@@ -39,7 +38,7 @@ async def trigger_call():
 
     call = client.calls.create(
         to=to_number,
-        from_=os.getenv("TWILIO_FROM_NUMBER"),  # unified env name
+        from_=os.getenv("TWILIO_FROM_NUMBER"),
         url=f"{os.getenv('RAILWAY_URL')}/voice"
     )
     print("CALL CREATED:", call.sid)
@@ -63,27 +62,25 @@ async def home():
     return "🚀 UniCall AI (Azure Streaming Version) is running!", 200
 
 
-# ---------- μ-law → PCM16 Conversion ----------
+# ---------- μ-law → PCM16 Conversion (Pure Python) ----------
 def convert_twilio_audio(raw_bytes: bytes) -> bytes:
     """
-    Twilio streams 8kHz μ-law audio. Convert to 16-bit PCM for Azure Speech.
-    Pure Python version (no audioop / ulaw dependency).
+    Twilio streams 8kHz μ-law audio. Convert to 16-bit PCM (no external libs).
     """
     try:
         pcm16 = bytearray()
         for b in raw_bytes:
-            b = b ^ 0xFF  # bit inversion
+            b ^= 0xFF
             sign = b & 0x80
-            exponent = (b & 0x70) >> 4
+            exponent = (b >> 4) & 0x07
             mantissa = b & 0x0F
-            magnitude = ((mantissa << 4) + 8) << (exponent + 3)
+            magnitude = ((mantissa << 3) + 0x84) << exponent
             sample = -magnitude if sign else magnitude
-            pcm16.extend(sample.to_bytes(2, byteorder='little', signed=True))
+            pcm16 += sample.to_bytes(2, "little", signed=True)
         return bytes(pcm16)
     except Exception as e:
         print("Audio conversion error:", e)
         return raw_bytes
-
 
 
 # ---------- Azure Speech Streaming ----------
@@ -153,8 +150,7 @@ async def synthesize_speech(text: str) -> bytes:
         "xi-api-key": ELEVEN_API_KEY,
         "Content-Type": "application/json"
     }
-    payload = {"text": text,
-               "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}}
+    payload = {"text": text, "voice_settings": {"stability": 0.4, "similarity_boost": 0.8}}
     r = requests.post(url, headers=headers, json=payload)
     return r.content
 
@@ -173,6 +169,7 @@ async def handle_twilio_media():
     )
 
     async def consume_ws():
+        """Receive audio from Twilio."""
         while True:
             msg = await ws.receive()
             if msg is None:
@@ -189,6 +186,7 @@ async def handle_twilio_media():
                 break
 
     async def consume_transcripts():
+        """Process caller speech and respond with AI voice."""
         while True:
             text = await transcript_queue.get()
             if text is None:
@@ -198,9 +196,13 @@ async def handle_twilio_media():
             ai_reply = await ask_ai(text)
             print("AI:", ai_reply)
 
+            # Convert text → speech (ElevenLabs)
             speech_bytes = await synthesize_speech(ai_reply)
+
+            # Convert to base64 for Twilio
             audio_base64 = base64.b64encode(speech_bytes).decode("utf-8")
 
+            # Send audio back to Twilio
             await ws.send(json.dumps({
                 "event": "media",
                 "media": {"payload": audio_base64}
